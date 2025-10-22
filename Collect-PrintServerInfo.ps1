@@ -1,57 +1,92 @@
 <#
 .SYNOPSIS
-    Collects full Print Server configuration and uploads results to Viyu n8n.
+  Collects full Print Server configuration and writes a single ZIP for handoff.
 .DESCRIPTION
-    - Enumerates all printer queues, ports, drivers, and permissions.
-    - Packages results into a single JSON payload per server.
-    - Sends the payload to a secure webhook for centralized ingestion.
-    - Requires local admin on the print server (or remote admin rights).
+  Gathers queues, ports, drivers, security ACLs (+ optional GPO report),
+  saves JSON/CSV artifacts to C:\ProgramData\Viyu\PrintServer\<Server>\,
+  then compresses the folder to a timestamped ZIP.
 .NOTES
-    Author: Viyu Network Solutions
-    Project: Impact Floors – Pinnacle Migration
+  Run as local admin on each print server (or with equivalent remote rights).
 #>
 
-# ---------- CONFIGURATION ----------
-$WebhookUri = "https://n8n.viyu.network/webhook/printserver_ingest"  # <-- replace with your endpoint
-$ServerName = $env:COMPUTERNAME
-$OutDir     = "C:\ProgramData\Viyu\PrintServer"
-New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+[CmdletBinding()] Param(
+  [string]$OutRoot = "C:\ProgramData\Viyu\PrintServer",
+  [switch]$IncludeGpoReport   # adds GPO XML reports if GroupPolicy module present
+)
 
-Import-Module PrintManagement -ErrorAction Stop
+$ErrorActionPreference = 'Stop'
+$server = $env:COMPUTERNAME
+$ts     = (Get-Date).ToString('yyyyMMdd-HHmmss')
+$work   = Join-Path $OutRoot $server
+$null = New-Item -ItemType Directory -Path $work -Force
 
-Write-Host "Collecting printer queues, ports, and drivers from $ServerName..."
+# Load modules if available
+try { Import-Module PrintManagement -ErrorAction Stop } catch { throw "PrintManagement module is required." }
+try { Import-Module GroupPolicy -ErrorAction SilentlyContinue } catch {}
 
-# ---------- DATA COLLECTION ----------
-$printers = Get-Printer | Select-Object Name,ShareName,DriverName,PortName,Location,Comment,Published
-$ports    = Get-PrinterPort | Select-Object Name,PrinterHostAddress,PortNumber,SNMP,Protocol
-$drivers  = Get-PrinterDriver | Select-Object Name,Manufacturer,DriverVersion,MajorVersion,InfPath
+Write-Host "[$server] Collecting printers/ports/drivers…"
+
+# --- Collect ---
+$printers = Get-Printer | Select Name,ShareName,DriverName,PortName,Location,Comment,Published,Type
+$ports    = Get-PrinterPort | Select Name,PrinterHostAddress,PortNumber,SNMP,Protocol
+$drivers  = Get-PrinterDriver | Select Name,Manufacturer,DriverVersion,MajorVersion,InfPath,IsXPSDriver
+
 $security = foreach($p in Get-Printer){
-    try{
-        [pscustomobject]@{
-            Printer  = $p.Name
-            SDDL     = (Get-PrinterProperty -PrinterName $p.Name -PropertyName "SecurityDescriptorSDDL").Value
-        }
-    }catch{}
+  try{
+    [pscustomobject]@{
+      Printer = $p.Name
+      SDDL    = (Get-PrinterProperty -PrinterName $p.Name -PropertyName "SecurityDescriptorSDDL").Value
+    }
+  } catch {
+    [pscustomobject]@{ Printer=$p.Name; SDDL="<unreadable>" }
+  }
 }
 
-$result = [pscustomobject]@{
-    Server     = $ServerName
-    TimeStamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    Printers   = $printers
-    Ports      = $ports
-    Drivers    = $drivers
-    Security   = $security
+# --- Save JSON for fidelity ---
+$meta = [pscustomobject]@{
+  Server    = $server
+  TimeStamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+}
+$meta        | ConvertTo-Json -Depth 6 | Out-File (Join-Path $work 'ServerMeta.json') -Encoding UTF8
+$printers    | ConvertTo-Json -Depth 6 | Out-File (Join-Path $work 'Printers.json')   -Encoding UTF8
+$ports       | ConvertTo-Json -Depth 6 | Out-File (Join-Path $work 'Ports.json')      -Encoding UTF8
+$drivers     | ConvertTo-Json -Depth 6 | Out-File (Join-Path $work 'Drivers.json')    -Encoding UTF8
+$security    | ConvertTo-Json -Depth 6 | Out-File (Join-Path $work 'Security.json')   -Encoding UTF8
+
+# --- Save CSV for quick review ---
+$printers | Export-Csv (Join-Path $work 'Printers.csv') -NoTypeInformation -Encoding UTF8
+$ports    | Export-Csv (Join-Path $work 'Ports.csv')    -NoTypeInformation -Encoding UTF8
+$drivers  | Export-Csv (Join-Path $work 'Drivers.csv')  -NoTypeInformation -Encoding UTF8
+$security | Export-Csv (Join-Path $work 'Security.csv') -NoTypeInformation -Encoding UTF8
+
+# --- Optional: GPO XML report (deployed printers, etc.) ---
+if ($IncludeGpoReport -and (Get-Module -ListAvailable GroupPolicy)) {
+  $gpoDir = Join-Path $work "GPOReports"
+  $null = New-Item -ItemType Directory -Path $gpoDir -Force
+  try {
+    Get-GPO -All | ForEach-Object {
+      Get-GPOReport -Guid $_.Id -ReportType Xml -Path (Join-Path $gpoDir "$($_.DisplayName).xml")
+    }
+  } catch {
+    Write-Warning "GPO export issue: $_"
+  }
 }
 
-# ---------- SAVE + UPLOAD ----------
-$OutFile = Join-Path $OutDir "$ServerName-PrintExport.json"
-$result | ConvertTo-Json -Depth 6 | Out-File $OutFile -Encoding UTF8
+# --- Compress to ZIP ---
+$zip = Join-Path $OutRoot ("{0}-{1}-PrintExport.zip" -f $server,$ts)
 
+# Prefer Compress-Archive; fall back to .NET if needed
 try {
-    Invoke-RestMethod -Uri $WebhookUri -Method Post -InFile $OutFile -ContentType "application/json" -ErrorAction Stop
-    Write-Host "Upload complete for $ServerName"
+  if (Get-Command Compress-Archive -ErrorAction SilentlyContinue) {
+    if (Test-Path $zip) { Remove-Item $zip -Force }
+    Compress-Archive -Path (Join-Path $work '*') -DestinationPath $zip
+  } else {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::CreateFromDirectory($work, $zip)
+  }
+  Write-Host "ZIP created: $zip"
 } catch {
-    Write-Warning "Upload failed: $_"
+  throw "Failed to create ZIP: $_"
 }
 
-Remove-Item $OutDir -Recurse -Force -ErrorAction SilentlyContinue
+Write-Host "Done."
