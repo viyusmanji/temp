@@ -8,9 +8,6 @@
     - POSTs the CSV content along with metadata (DeviceName, Username, Timestamp) to the configured n8n webhook.
     - Cleans up temporary files automatically.
 .NOTES
-    Author: Viyu Network Solutions
-    For use by: Pinnacle IT team
-    Context: Impact Floors M365/Intune Migration (Autopilot-based)
 #>
 
 # ---------- CONFIGURATION ----------
