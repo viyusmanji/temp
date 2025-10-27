@@ -20,10 +20,15 @@ New-Item -Path $OutDir -ItemType Directory -Force | Out-Null
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 
 # ---------- DOWNLOAD / VALIDATE SCRIPT ----------
+try {
+    Write-Host "Downloading Get-WindowsAutoPilotInfo.ps1 from PowerShell Gallery..."
+    Install-Script -Name Get-WindowsAutoPilotInfo -Force -ErrorAction Stop
+} catch {
     Write-Host "Failed to install script. Attempting manual download..."
     $scriptUrl = "https://raw.githubusercontent.com/Microsoft/WindowsAutopilotInfo/master/Get-WindowsAutoPilotInfo.ps1"
     $localPath = "$OutDir\Get-WindowsAutoPilotInfo.ps1"
     Invoke-WebRequest -Uri $scriptUrl -OutFile $localPath -UseBasicParsing
+}
 
 # ---------- RUN SCRIPT ----------
 try {
