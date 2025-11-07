@@ -16,9 +16,15 @@
 .PARAMETER OutputPath
     Directory for exports (default: ./exports/shared-mailboxes or $HOME/exports/shared-mailboxes)
 
+.PARAMETER InputCsv
+    Optional CSV file containing shared mailboxes to filter. CSV should have an "Email address" column.
+    If provided, only shared mailboxes matching emails in the CSV will be processed.
+
 .EXAMPLE
     pwsh .\Export-SharedMailboxesComplete.ps1
     pwsh .\Export-SharedMailboxesComplete.ps1 -OutputPath "./my-exports"
+    pwsh .\Export-SharedMailboxesComplete.ps1 -InputCsv "./Final_All_SharedMailboxes.csv"
+    pwsh .\Export-SharedMailboxesComplete.ps1 -InputCsv "./mailboxes.csv" -OutputPath "./exports"
 
 .NOTES
     Requires:
@@ -31,7 +37,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [string]$OutputPath
+    [string]$OutputPath,
+    [Parameter(Mandatory = $false)]
+    [string]$InputCsv
 )
 
 #region Configuration
@@ -150,20 +158,102 @@ function Connect-ExchangeOnlineSession {
 #endregion
 
 #region Data Retrieval Functions
+function Import-SharedMailboxFilter {
+    <#
+    .SYNOPSIS
+        Imports email addresses from CSV file for filtering
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CsvPath
+    )
+
+    Write-Status "Reading filter CSV: $CsvPath" "Cyan"
+    
+    if (-not (Test-Path -Path $CsvPath)) {
+        Write-Error "CSV file not found: $CsvPath"
+        throw
+    }
+
+    try {
+        $csvData = Import-Csv -Path $CsvPath -Encoding UTF8 -ErrorAction Stop
+        
+        # Try to find the email column - check common column names
+        $emailColumn = $null
+        $possibleColumns = @("Email address", "EmailAddress", "Email", "PrimarySmtpAddress", "UPN", "UserPrincipalName")
+        
+        foreach ($col in $possibleColumns) {
+            if ($csvData[0].PSObject.Properties.Name -contains $col) {
+                $emailColumn = $col
+                break
+            }
+        }
+        
+        if (-not $emailColumn) {
+            Write-Warning "Could not find email column. Available columns: $($csvData[0].PSObject.Properties.Name -join ', ')"
+            Write-Warning "Attempting to use first column as email address..."
+            $emailColumn = $csvData[0].PSObject.Properties.Name[0]
+        }
+        
+        $emailAddresses = $csvData | ForEach-Object { 
+            $email = $_.$emailColumn
+            if ($email) { $email.Trim() }
+        } | Where-Object { $null -ne $_ -and $_ -ne "" }
+        
+        $uniqueEmails = $emailAddresses | Select-Object -Unique
+        Write-Status "Found $($uniqueEmails.Count) unique email address(es) in CSV" "Green"
+        
+        return $uniqueEmails
+    } catch {
+        Write-Error "Failed to read CSV file: $($_.Exception.Message)"
+        throw
+    }
+}
+
 function Get-AllSharedMailboxes {
     <#
     .SYNOPSIS
-        Retrieves all shared mailboxes from the tenant
+        Retrieves all shared mailboxes from the tenant, optionally filtered by CSV
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter(Mandatory = $false)]
+        [string[]]$FilterEmails = $null
+    )
 
     Write-Status "Retrieving all shared mailboxes..." "Cyan"
     
     try {
         $allSharedMailboxes = Get-ExoMailbox -ResultSize Unlimited -RecipientTypeDetails SharedMailbox -ErrorAction Stop
-        $mailboxCount = ($allSharedMailboxes | Measure-Object).Count
-        Write-Status "Found $mailboxCount shared mailbox(es)" "Green"
+        $totalCount = ($allSharedMailboxes | Measure-Object).Count
+        Write-Status "Found $totalCount shared mailbox(es) in tenant" "Green"
+        
+        # Filter if email list provided
+        if ($null -ne $FilterEmails -and $FilterEmails.Count -gt 0) {
+            Write-Status "Filtering to $($FilterEmails.Count) mailbox(es) from CSV..." "Cyan"
+            $filteredMailboxes = $allSharedMailboxes | Where-Object { 
+                $mailboxEmail = $_.PrimarySmtpAddress
+                $matchingAlias = $_.EmailAddresses | Where-Object { $_ -in $FilterEmails }
+                $mailboxEmail -in $FilterEmails -or ($null -ne $matchingAlias -and $matchingAlias.Count -gt 0)
+            }
+            
+            $filteredCount = ($filteredMailboxes | Measure-Object).Count
+            Write-Status "Filtered to $filteredCount matching shared mailbox(es)" "Green"
+            
+            # Report any emails from CSV that weren't found
+            $foundEmails = $filteredMailboxes | ForEach-Object { $_.PrimarySmtpAddress }
+            $notFound = $FilterEmails | Where-Object { $_ -notin $foundEmails }
+            if ($notFound.Count -gt 0) {
+                Write-Status "Warning: $($notFound.Count) email(s) from CSV not found in tenant:" "Yellow"
+                foreach ($email in $notFound) {
+                    Write-Status "  - $email" "Yellow"
+                }
+            }
+            
+            return $filteredMailboxes
+        }
+        
         return $allSharedMailboxes
     } catch {
         Write-Error "Failed to retrieve shared mailboxes: $($_.Exception.Message)"
@@ -401,7 +491,9 @@ function Export-SummaryReport {
         [Parameter(Mandatory = $true)]
         [int]$FullAccessCount,
         [Parameter(Mandatory = $true)]
-        [int]$SendAsCount
+        [int]$SendAsCount,
+        [Parameter(Mandatory = $false)]
+        [string]$FilterCsv = $null
     )
 
     Write-Status "`nGenerating summary report..." "Cyan"
@@ -413,6 +505,12 @@ function Export-SummaryReport {
         $tenantName = "Unable to retrieve"
     }
     
+    $filterInfo = if ($FilterCsv) {
+        "Filter CSV: $FilterCsv`nFiltered Export: Yes"
+    } else {
+        "Filter CSV: None`nFiltered Export: No (All shared mailboxes exported)"
+    }
+    
     $summary = @"
 Shared Mailbox Export Summary
 ==============================
@@ -420,6 +518,8 @@ Export Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 PowerShell Version: $($PSVersionTable.PSVersion)
 Platform: $($PSVersionTable.Platform)
 Tenant: $tenantName
+
+$filterInfo
 
 Total Shared Mailboxes: $MailboxCount
 Total Full Access Permissions: $FullAccessCount
@@ -449,7 +549,9 @@ function Start-SharedMailboxExport {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$OutputPath
+        [string]$OutputPath,
+        [Parameter(Mandatory = $false)]
+        [string]$InputCsv = $null
     )
 
     Write-Status "=== Shared Mailbox Complete Export ===" "Cyan"
@@ -464,8 +566,14 @@ function Start-SharedMailboxExport {
     Import-ExchangeOnlineModule | Out-Null
     Connect-ExchangeOnlineSession | Out-Null
 
+    # Load filter if CSV provided
+    $filterEmails = $null
+    if ($InputCsv) {
+        $filterEmails = Import-SharedMailboxFilter -CsvPath $InputCsv
+    }
+
     # Retrieve data
-    $allSharedMailboxes = Get-AllSharedMailboxes
+    $allSharedMailboxes = Get-AllSharedMailboxes -FilterEmails $filterEmails
     
     if (($allSharedMailboxes | Measure-Object).Count -eq 0) {
         Write-Status "No shared mailboxes found in the tenant." "Yellow"
@@ -489,7 +597,8 @@ function Start-SharedMailboxExport {
     Export-SummaryReport -OutputPath $OutputPath `
         -MailboxCount $mailboxDetails.Count `
         -FullAccessCount $fullAccessPermissions.Count `
-        -SendAsCount $sendAsPermissions.Count | Out-Null
+        -SendAsCount $sendAsPermissions.Count `
+        -FilterCsv $InputCsv | Out-Null
 
     # Display final summary
     Write-Status "`n=== Export Complete ===" "Cyan"
@@ -503,7 +612,7 @@ function Start-SharedMailboxExport {
 
 # Execute main function
 try {
-    Start-SharedMailboxExport -OutputPath $OutputPath
+    Start-SharedMailboxExport -OutputPath $OutputPath -InputCsv $InputCsv
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
     Write-Host $_.ScriptStackTrace -ForegroundColor Red
